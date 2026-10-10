@@ -1,0 +1,30 @@
+{
+  "name": "snapprints-backend",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "create-admin": "node scripts/create-admin.js",
+    "daily-stats": "node scripts/generate-daily-stats.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1149.0",
+    "@aws-sdk/s3-request-presigner": "^3.1149.0",
+    "bcrypt": "^6.0.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.16.1",
+    "node-cron": "^4.2.1",
+    "pdf-parse": "^1.1.1",
+    "razorpay": "^2.9.6",
+    "resend": "^6.18.1",
+    "socket.io": "^4.8.3"
+  }
+}

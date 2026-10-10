@@ -1,0 +1,11 @@
+node_modules/
+
+# Secrets — never commit
+.env
+.env.*
+*.env
+!.env.example
+
+# Customer documents (temporary print cache)
+uploads/*
+!uploads/.gitkeep
