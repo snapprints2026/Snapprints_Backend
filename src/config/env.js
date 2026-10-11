@@ -10,7 +10,7 @@ const env = {
 
   // Public URL of this API, handed to Raspberry Pi kiosks on registration
   API_BASE_URL:
-    process.env.API_BASE_URL || "https://uploadsnapprints-production.up.railway.app/api",
+    process.env.API_BASE_URL || "https://snapprintsbackend-production.up.railway.app/api",
 
   JWT_SECRET: process.env.JWT_SECRET,
 
