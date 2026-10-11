@@ -7,6 +7,7 @@ const allowedOrigins = [
   "https://snap-prints.vercel.app",
   "https://snapprints-eight.vercel.app",
   "https://snapprints-portfolio-dheg.vercel.app",
+  "https://snapprints-frontend.vercel.app",
 ];
 
 function isAllowedOrigin(origin) {
