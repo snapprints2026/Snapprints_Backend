@@ -179,15 +179,24 @@ const PRINTED_STATS_JOIN = `
   ) ps ON ps.machine_id = m.machine_id
 `;
 
-// Highest MHxxxx number + 1 (MH1000 for the very first machine).
-async function nextMachineId(conn) {
-  const [[row]] = await conn.query(`
-    SELECT MAX(CAST(SUBSTRING(machine_id, 3) AS UNSIGNED)) AS n
-    FROM machines
-    WHERE machine_id REGEXP '^MH[0-9]+$'
-  `);
-  const n = row && row.n ? Number(row.n) + 1 : 1000;
-  return "MH" + String(n).padStart(4, "0");
+// Machine IDs: SP (SnapPrints) + K (kiosk) / S (shop computer) + number.
+//   Kiosks:         SPK1001, SPK1002, …
+//   Shop computers: SPS1001, SPS1002, …
+// Each type counts on its own. Old MH… machines keep their IDs and are
+// simply ignored by this counter.
+const MACHINE_ID_PREFIX = { KIOSK: "SPK", SHOP: "SPS" };
+const MACHINE_ID_START  = 1001;
+
+async function nextMachineId(conn, module) {
+  const prefix = MACHINE_ID_PREFIX[module] || MACHINE_ID_PREFIX.KIOSK;
+  const [[row]] = await conn.query(
+    `SELECT MAX(CAST(SUBSTRING(machine_id, ?) AS UNSIGNED)) AS n
+     FROM machines
+     WHERE machine_id REGEXP ?`,
+    [prefix.length + 1, `^${prefix}[0-9]+$`]
+  );
+  const n = row && row.n ? Number(row.n) + 1 : MACHINE_ID_START;
+  return prefix + String(n).padStart(4, "0");
 }
 
 /* ===========================
@@ -287,7 +296,7 @@ exports.createMachine = async (req, res) => {
           cols.map((c) => locationFields[c])
         );
 
-        const machineId = await nextMachineId(conn);
+        const machineId = await nextMachineId(conn, module);
 
         await conn.query(
           `
@@ -375,7 +384,7 @@ exports.updateMachine = async (req, res) => {
     await conn.beginTransaction();
 
     const [[machine]] = await conn.query(
-      `SELECT m.machine_id, m.location_id, m.owner_vendor_id, v.allowed_modules
+      `SELECT m.machine_id, m.module, m.location_id, m.owner_vendor_id, v.allowed_modules
        FROM machines m
        LEFT JOIN vendors v ON v.id = m.owner_vendor_id
        WHERE m.machine_id = ?
@@ -384,9 +393,14 @@ exports.updateMachine = async (req, res) => {
     );
     if (!machine) throw notFound("Machine not found");
 
-    if (machineFields.module && machine.owner_vendor_id) {
-      assertVendorHasModule(machine, machineFields.module);
+    // The module is part of the machine ID (SPK… / SPS…), so it can't change
+    // after creation — create a new machine of the other type instead.
+    if (machineFields.module && machineFields.module !== (machine.module || "KIOSK")) {
+      throw badRequest(
+        "A machine's type can't be changed because it is part of the machine ID. Create a new machine of the other type instead."
+      );
     }
+    delete machineFields.module;
     if (has(machineFields, "name") && !machineFields.name) {
       machineFields.name = machine.machine_id;
     }
