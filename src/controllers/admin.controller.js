@@ -7,6 +7,190 @@ const env     = require("../config/env");
 const SERVER_API_BASE = env.API_BASE_URL;
 
 /* ===========================
+   SHARED HELPERS — input cleaning / validation for machines & vendors
+=========================== */
+const MODULES = ["KIOSK", "SHOP"];
+const WEEK_DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+const INSTITUTION_TYPES = ["COLLEGE", "UNIVERSITY", "SCHOOL", "COACHING", "SHOP", "OTHER"];
+
+const has = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
+
+function badRequest(message) {
+  const e = new Error(message);
+  e.status = 400;
+  return e;
+}
+
+function notFound(message) {
+  const e = new Error(message);
+  e.status = 404;
+  return e;
+}
+
+// Trim; empty string → NULL; optionally cut to the column length.
+function clean(v, max) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  return max ? s.slice(0, max) : s;
+}
+
+function parsePincode(v) {
+  const s = clean(v);
+  if (!s) return null;
+  if (!/^\d{6}$/.test(s)) throw badRequest("Pincode must be 6 digits");
+  return s;
+}
+
+function parsePhone(v, label) {
+  const s = clean(v);
+  if (!s) return null;
+  const compact = s.replace(/[\s-]/g, "");
+  if (!/^\+?\d{10,13}$/.test(compact)) throw badRequest(`Invalid ${label}`);
+  return compact;
+}
+
+function parseCoord(v, min, max, label) {
+  if (v === undefined || v === null || String(v).trim() === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < min || n > max) throw badRequest(`Invalid ${label}`);
+  return n;
+}
+
+// "9:00", "09:00" or "09:00:00" → "09:00:00"
+function parseTime(v) {
+  const s = clean(v);
+  if (!s) return null;
+  const m = s.match(/^([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+  if (!m) throw badRequest(`Invalid time "${s}" — use HH:MM`);
+  return `${m[1].padStart(2, "0")}:${m[2]}:00`;
+}
+
+// ["SUN"] / "sat,sun" / "Sunday" → "SAT,SUN" (always in week order)
+function parseWeeklyOff(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const list = (Array.isArray(v) ? v : String(v).split(","))
+    .map((d) => String(d).trim().toUpperCase().slice(0, 3))
+    .filter(Boolean);
+  const bad = list.find((d) => !WEEK_DAYS.includes(d));
+  if (bad) throw badRequest(`Invalid weekly off day "${bad}"`);
+  const ordered = WEEK_DAYS.filter((d) => list.includes(d));
+  return ordered.length ? ordered.join(",") : null;
+}
+
+function parseDate(v) {
+  const s = clean(v);
+  if (!s) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(Date.parse(s))) {
+    throw badRequest("Installation date must be YYYY-MM-DD");
+  }
+  return s;
+}
+
+function parseModule(v) {
+  const m = String(v || "KIOSK").trim().toUpperCase();
+  if (!MODULES.includes(m)) throw badRequest("module must be KIOSK or SHOP");
+  return m;
+}
+
+function vendorModules(vendor) {
+  return String((vendor && vendor.allowed_modules) || "KIOSK")
+    .split(",")
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function assertVendorHasModule(vendor, module) {
+  const allowed = vendorModules(vendor);
+  if (!allowed.includes(module)) {
+    throw badRequest(
+      `This vendor has not bought the ${module} module (allowed: ${allowed.join(", ")})`
+    );
+  }
+}
+
+// request-body key → [locations column, parser]
+const LOCATION_INPUTS = {
+  locationName: ["name",          (v) => clean(v, 200)],
+  campusName:   ["campus_name",   (v) => clean(v, 150)],
+  building:     ["building",      (v) => clean(v, 100)],
+  floor:        ["floor",         (v) => clean(v, 50)],
+  spot:         ["spot",          (v) => clean(v, 150)],
+  landmark:     ["landmark",      (v) => clean(v, 200)],
+  address:      ["address",       (v) => clean(v, 500)],
+  city:         ["city",          (v) => clean(v, 100)],
+  state:        ["state",         (v) => clean(v, 100)],
+  pincode:      ["pincode",       parsePincode],
+  latitude:     ["latitude",      (v) => parseCoord(v, -90, 90, "latitude")],
+  longitude:    ["longitude",     (v) => parseCoord(v, -180, 180, "longitude")],
+  contactName:  ["contact_name",  (v) => clean(v, 120)],
+  contactPhone: ["contact_phone", (v) => parsePhone(v, "on-site contact phone")],
+  openTime:     ["open_time",     parseTime],
+  closeTime:    ["close_time",    parseTime],
+  weeklyOff:    ["weekly_off",    parseWeeklyOff],
+};
+
+// request-body key → [machines column, parser]
+const MACHINE_INPUTS = {
+  printerModel: ["printer_model", (v) => clean(v, 100)],
+  installedAt:  ["installed_at",  parseDate],
+};
+
+// onlyPresent = true → only fields the client actually sent (for partial updates)
+function readFields(body, spec, { onlyPresent }) {
+  const out = {};
+  for (const [key, [column, parse]] of Object.entries(spec)) {
+    if (onlyPresent && !has(body, key)) continue;
+    out[column] = parse(body[key]);
+  }
+  return out;
+}
+
+// "ABC College · Main Campus · Block B, Ground floor · Library entrance"
+function buildLocationLabel(r) {
+  const where = [r.building, r.floor].filter(Boolean).join(", ");
+  let inside = [r.campus_name, where, r.spot].filter(Boolean);
+  if (!inside.length && r.location_name) inside = [r.location_name];
+  const parts = [r.vendor_name, ...inside].filter(Boolean);
+  return parts.length ? parts.join(" · ") : null;
+}
+
+// Columns every machine list / detail needs to show WHERE a machine is.
+// Expects aliases: m = machines, l = locations, v = vendors.
+const MACHINE_LOCATION_COLUMNS = `
+  m.machine_id, m.name, m.module, m.status, m.is_print_locked, m.last_seen_at,
+  m.owner_vendor_id, m.printer_model,
+  DATE_FORMAT(m.installed_at, '%Y-%m-%d') AS installed_at,
+  COALESCE(v.business_name, v.full_name) AS vendor_name,
+  l.name AS location_name, l.campus_name, l.building, l.floor, l.spot, l.landmark,
+  l.address, l.city, l.state, l.pincode, l.latitude, l.longitude,
+  l.contact_name, l.contact_phone,
+  TIME_FORMAT(l.open_time,  '%H:%i') AS open_time,
+  TIME_FORMAT(l.close_time, '%H:%i') AS close_time,
+  l.weekly_off
+`;
+
+const PRINTED_STATS_JOIN = `
+  LEFT JOIN (
+    SELECT machine_id, COUNT(*) AS total_jobs, SUM(amount) AS revenue
+    FROM print_jobs
+    WHERE status='PRINTED'
+    GROUP BY machine_id
+  ) ps ON ps.machine_id = m.machine_id
+`;
+
+// Highest MHxxxx number + 1 (MH1000 for the very first machine).
+async function nextMachineId(conn) {
+  const [[row]] = await conn.query(`
+    SELECT MAX(CAST(SUBSTRING(machine_id, 3) AS UNSIGNED)) AS n
+    FROM machines
+    WHERE machine_id REGEXP '^MH[0-9]+$'
+  `);
+  const n = row && row.n ? Number(row.n) + 1 : 1000;
+  return "MH" + String(n).padStart(4, "0");
+}
+
+/* ===========================
    DASHBOARD STATS
 =========================== */
 exports.getStats = async (req, res) => {
@@ -50,213 +234,210 @@ exports.getStats = async (req, res) => {
 
 /* ===========================
    CREATE MACHINE
+   Body (all optional except where noted):
+     vendorId, module ('KIOSK' | 'SHOP'), name,
+     campusName, building, floor, spot, landmark, locationName,
+     address, city, state, pincode, latitude, longitude,
+     contactName, contactPhone, openTime, closeTime, weeklyOff,
+     printerModel, installedAt
+   The location + machine rows are written in one transaction, and the
+   machine ID is retried if two admins create a machine at the same time.
 =========================== */
 exports.createMachine = async (req, res) => {
   try {
-    console.log("CREATE MACHINE BODY:", req.body);
+    const body = { ...(req.body || {}) };
 
-    const {
-      name,
-      location,
-      locationName,
-      address,
-      city,
-      state,
-      pincode,
-      latitude,
-      longitude
-    } = req.body;
+    // Old clients send `location` instead of `locationName`
+    if (!body.locationName && body.location) body.locationName = body.location;
 
-    // Use old location field if locationName not sent
-    const finalLocationName =
-      locationName ||
-      location ||
-      `${name || "Machine"} Location`;
+    const locationFields = readFields(body, LOCATION_INPUTS, { onlyPresent: false });
+    const machineFields  = readFields(body, MACHINE_INPUTS,  { onlyPresent: false });
+    const module = parseModule(body.module);
+    const name   = clean(body.name, 150);
 
-    const [rows] = await db.query(`
-      SELECT machine_id
-      FROM machines
-      ORDER BY id DESC
-      LIMIT 1
-    `);
-
-    let machineId = "MH1000";
-
-    if (rows.length > 0) {
-      const lastNumber = parseInt(
-        rows[0].machine_id.replace("MH", ""),
-        10
+    let vendor = null;
+    if (body.vendorId) {
+      const [[v]] = await db.query(
+        `SELECT id, full_name, business_name, allowed_modules, status FROM vendors WHERE id=?`,
+        [body.vendorId]
       );
-
-      machineId =
-        "MH" +
-        String(lastNumber + 1).padStart(4, "0");
+      if (!v) throw notFound("Vendor not found");
+      if (v.status !== "ACTIVE") throw badRequest("This vendor is not active");
+      assertVendorHasModule(v, module);
+      vendor = v;
     }
 
-    // Create location record
-    const [locationResult] = await db.query(
-      `
-      INSERT INTO locations
-      (
-        name,
-        address,
-        city,
-        state,
-        pincode,
-        latitude,
-        longitude
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        finalLocationName,
-        address || null,
-        city || null,
-        state || null,
-        pincode || null,
-        latitude || null,
-        longitude || null
-      ]
-    );
-
-    const locationId = locationResult.insertId;
+    if (!locationFields.name) {
+      const where = [locationFields.spot, locationFields.building].filter(Boolean).join(", ");
+      locationFields.name = clean(where, 200) || `${name || "Machine"} Location`;
+    }
 
     const apiKey = crypto.randomBytes(32).toString("hex");
+    const hash   = await bcrypt.hash(apiKey, 10);
 
-    const hash = await bcrypt.hash(apiKey, 10);
+    for (let attempt = 1; ; attempt++) {
+      const conn = await db.getConnection();
+      try {
+        await conn.beginTransaction();
 
-    await db.query(
-      `
-      INSERT INTO machines
-      (
-        machine_id,
-        name,
-        location_id,
-        status,
-        assigned,
-        api_key_hash
-      )
-      VALUES
-      (
-        ?, ?, ?, 'PENDING', FALSE, ?
-      )
-      `,
-      [
-        machineId,
-        name || machineId,
-        locationId,
-        hash
-      ]
-    );
+        // Column names come from LOCATION_INPUTS (fixed list), never from the client.
+        const cols = Object.keys(locationFields);
+        const [locationResult] = await conn.query(
+          `INSERT INTO locations (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
+          cols.map((c) => locationFields[c])
+        );
 
-    res.json({
-      success: true,
-      message: "Machine created successfully",
-      credentials: {
-        MACHINE_ID: machineId,
-        API_KEY: apiKey,
-        API_BASE: SERVER_API_BASE
+        const machineId = await nextMachineId(conn);
+
+        await conn.query(
+          `
+          INSERT INTO machines
+            (machine_id, name, module, location_id, owner_vendor_id,
+             status, assigned, api_key_hash, printer_model, installed_at)
+          VALUES (?, ?, ?, ?, ?, 'PENDING', FALSE, ?, ?, ?)
+          `,
+          [
+            machineId,
+            name || machineId,
+            module,
+            locationResult.insertId,
+            vendor ? vendor.id : null,
+            hash,
+            machineFields.printer_model,
+            machineFields.installed_at,
+          ]
+        );
+
+        await conn.query(
+          `INSERT INTO audit_logs (machine_id, action_type, actor_admin_id, details)
+           VALUES (?, 'MACHINE_CREATED', ?, ?)`,
+          [
+            machineId,
+            req.staff ? req.staff.id : null,
+            JSON.stringify({ module, vendor_id: vendor ? vendor.id : null }),
+          ]
+        );
+
+        await conn.commit();
+
+        return res.json({
+          success: true,
+          message: "Machine created successfully",
+          machine: {
+            machine_id: machineId,
+            module,
+            location_label: buildLocationLabel({
+              ...locationFields,
+              location_name: locationFields.name,
+              vendor_name: vendor ? vendor.business_name || vendor.full_name : null,
+            }),
+          },
+          credentials: {
+            MACHINE_ID: machineId,
+            API_KEY: apiKey,
+            API_BASE: SERVER_API_BASE,
+          },
+        });
+      } catch (err) {
+        await conn.rollback().catch(() => {});
+        const idClash = err.code === "ER_DUP_ENTRY" && /machine_id/.test(err.message || "");
+        if (idClash && attempt < 5) continue; // someone took that ID — try the next one
+        throw err;
+      } finally {
+        conn.release();
       }
-    });
-
+    }
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, error: err.message });
     console.error("CREATE MACHINE ERROR:", err);
-
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    res.status(500).json({ success: false, error: "Failed to create machine" });
   }
 };
 
 /* ===========================
    UPDATE MACHINE
+   Partial update: only the fields present in the body are changed, so
+   the form can send everything and older clients can send only a few.
+   Vendor changes still go through assign / unassign.
 =========================== */
-
 exports.updateMachine = async (req, res) => {
+  const conn = await db.getConnection();
   try {
-
     const { machineId } = req.params;
+    const body = { ...(req.body || {}) };
+    if (!has(body, "locationName") && has(body, "location")) body.locationName = body.location;
 
-    const {
-      name,
-      locationName,
-      address,
-      city,
-      state,
-      pincode,
-      latitude,
-      longitude,
-    } = req.body;
+    const locationFields = readFields(body, LOCATION_INPUTS, { onlyPresent: true });
+    const machineFields  = readFields(body, MACHINE_INPUTS,  { onlyPresent: true });
+    if (has(body, "name"))   machineFields.name   = clean(body.name, 150);
+    if (has(body, "module")) machineFields.module = parseModule(body.module);
 
-    const [[machine]] = await db.query(
-      `
-      SELECT location_id
-      FROM machines
-      WHERE machine_id = ?
-      `,
+    await conn.beginTransaction();
+
+    const [[machine]] = await conn.query(
+      `SELECT m.machine_id, m.location_id, m.owner_vendor_id, v.allowed_modules
+       FROM machines m
+       LEFT JOIN vendors v ON v.id = m.owner_vendor_id
+       WHERE m.machine_id = ?
+       FOR UPDATE`,
       [machineId]
     );
+    if (!machine) throw notFound("Machine not found");
 
-    if (!machine) {
-      return res.status(404).json({
-        success: false,
-        message: "Machine not found",
-      });
+    if (machineFields.module && machine.owner_vendor_id) {
+      assertVendorHasModule(machine, machineFields.module);
+    }
+    if (has(machineFields, "name") && !machineFields.name) {
+      machineFields.name = machine.machine_id;
     }
 
-    await db.query(
-      `
-      UPDATE locations
-      SET
-        name = ?,
-        address = ?,
-        city = ?,
-        state = ?,
-        pincode = ?,
-        latitude = ?,
-        longitude = ?
-      WHERE id = ?
-      `,
-      [
-        locationName,
-        address,
-        city,
-        state,
-        pincode,
-        latitude || null,
-        longitude || null,
-        machine.location_id,
-      ]
+    const locCols = Object.keys(locationFields);
+    if (locCols.length) {
+      if (machine.location_id) {
+        await conn.query(
+          `UPDATE locations SET ${locCols.map((c) => `${c} = ?`).join(", ")} WHERE id = ?`,
+          [...locCols.map((c) => locationFields[c]), machine.location_id]
+        );
+      } else {
+        const [r] = await conn.query(
+          `INSERT INTO locations (${locCols.join(", ")}) VALUES (${locCols.map(() => "?").join(", ")})`,
+          locCols.map((c) => locationFields[c])
+        );
+        machineFields.location_id = r.insertId;
+      }
+    }
+
+    const mCols = Object.keys(machineFields);
+    if (mCols.length) {
+      await conn.query(
+        `UPDATE machines SET ${mCols.map((c) => `${c} = ?`).join(", ")} WHERE machine_id = ?`,
+        [...mCols.map((c) => machineFields[c]), machineId]
+      );
+    }
+
+    await conn.query(
+      `INSERT INTO audit_logs (machine_id, action_type, actor_admin_id, details)
+       VALUES (?, 'MACHINE_UPDATED', ?, ?)`,
+      [machineId, req.staff ? req.staff.id : null, JSON.stringify({ fields: [...locCols, ...mCols] })]
     );
 
-    await db.query(
-      `
-      UPDATE machines
-      SET
-        name = ?
-      WHERE machine_id = ?
-      `,
-      [
-        name,
-        machineId,
-      ]
-    );
+    await conn.commit();
 
     res.json({
       success: true,
       message: "Machine updated successfully",
     });
-
   } catch (err) {
-
-    console.error(err);
-
+    await conn.rollback().catch(() => {});
+    if (err.status) return res.status(err.status).json({ success: false, error: err.message, message: err.message });
+    console.error("UPDATE MACHINE ERROR:", err);
     res.status(500).json({
       success: false,
+      error: "Unable to update machine",
       message: "Unable to update machine",
     });
-
+  } finally {
+    conn.release();
   }
 };
 
@@ -465,40 +646,22 @@ exports.getRevenue = async (req, res) => {
 };
 
 /* ===========================
-   MACHINE INFO
+   MACHINE INFO — admin machines list with vendor + campus location,
+   a ready-made `location_label` and online flag.
 =========================== */
 exports.getMachineInfo = async (req, res) => {
   try {
     const [machines] = await db.query(`
-SELECT
-    m.machine_id,
-    m.name,
-    m.status,
-    m.is_print_locked,
-    m.last_seen_at,
-
-    l.name AS location_name,
-    l.address,
-    l.city,
-    l.state,
-    l.pincode,
-
-    COUNT(p.id) AS total_jobs,
-    COALESCE(SUM(p.amount),0) AS revenue
-
-FROM machines m
-
-LEFT JOIN locations l
-ON m.location_id = l.id
-
-LEFT JOIN print_jobs p
-ON p.machine_id = m.machine_id
-AND p.status='PRINTED'
-
-GROUP BY m.id
-
-ORDER BY m.created_at DESC
-`);
+      SELECT
+        ${MACHINE_LOCATION_COLUMNS},
+        COALESCE(ps.total_jobs, 0) AS total_jobs,
+        COALESCE(ps.revenue, 0)    AS revenue
+      FROM machines m
+      LEFT JOIN locations l ON l.id = m.location_id
+      LEFT JOIN vendors   v ON v.id = m.owner_vendor_id
+      ${PRINTED_STATS_JOIN}
+      ORDER BY m.created_at DESC
+    `);
 
     const now = Date.now();
 
@@ -508,7 +671,7 @@ ORDER BY m.created_at DESC
         const diff = (now - new Date(m.last_seen_at).getTime()) / 1000;
         isOnline = diff < 120;
       }
-      return { ...m, is_online: isOnline };
+      return { ...m, location_label: buildLocationLabel(m), is_online: isOnline };
     });
 
     res.json(result);
@@ -552,10 +715,15 @@ exports.machineReport = async (req, res) => {
 /* ===========================
    CREATE VENDOR
    Admin sets an initial password directly (no self-signup for vendors).
+   fullName     = contact PERSON, businessName = INSTITUTION name.
+   allowedModules: 'KIOSK' | 'SHOP' | 'KIOSK,SHOP' (or an array).
 =========================== */
 exports.createVendor = async (req, res) => {
   try {
-    const { fullName, email, phone, businessName, gstNumber, password } = req.body;
+    const {
+      fullName, email, phone, businessName, gstNumber, password,
+      contactDesignation, altPhone, institutionType, panNumber, billingAddress, allowedModules,
+    } = req.body;
 
     if (!fullName || !email || !password) {
       return res.status(400).json({ error: "fullName, email and password are required" });
@@ -563,20 +731,74 @@ exports.createVendor = async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
 
+    const type = String(institutionType || "COLLEGE").trim().toUpperCase();
+    if (!INSTITUTION_TYPES.includes(type)) {
+      return res.status(400).json({ error: "Invalid institution type" });
+    }
+
+    const pan = clean(panNumber);
+    if (pan && !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan.toUpperCase())) {
+      return res.status(400).json({ error: "Invalid PAN (format: ABCDE1234F)" });
+    }
+
+    const gst = clean(gstNumber);
+    if (gst && !/^[0-9]{2}[A-Z0-9]{13}$/.test(gst.toUpperCase())) {
+      return res.status(400).json({ error: "Invalid GST number (15 characters)" });
+    }
+
+    const modules = (Array.isArray(allowedModules) ? allowedModules : String(allowedModules || "KIOSK").split(","))
+      .map((s) => String(s).trim().toUpperCase())
+      .filter(Boolean);
+    if (!modules.length || modules.some((m) => !MODULES.includes(m))) {
+      return res.status(400).json({ error: "allowedModules must be KIOSK, SHOP or both" });
+    }
+    const modulesValue = MODULES.filter((m) => modules.includes(m)).join(",");
+
+    let cleanPhone, cleanAltPhone;
+    try {
+      cleanPhone    = parsePhone(phone, "phone");
+      cleanAltPhone = parsePhone(altPhone, "alternate phone");
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+
     const [[existing]] = await db.query(`SELECT id FROM vendors WHERE email=?`, [cleanEmail]);
     if (existing) return res.status(409).json({ error: "A vendor with this email already exists" });
 
     const hash = await bcrypt.hash(password, 10);
 
     const [result] = await db.query(
-      `INSERT INTO vendors (full_name, email, phone, password_hash, business_name, gst_number, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')`,
-      [fullName.trim(), cleanEmail, phone || null, hash, businessName || null, gstNumber || null]
+      `INSERT INTO vendors
+         (full_name, contact_designation, email, phone, alt_phone, password_hash,
+          business_name, institution_type, gst_number, pan_number, billing_address,
+          allowed_modules, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')`,
+      [
+        fullName.trim(),
+        clean(contactDesignation, 100),
+        cleanEmail,
+        cleanPhone,
+        cleanAltPhone,
+        hash,
+        clean(businessName, 200),
+        type,
+        gst ? gst.toUpperCase() : null,
+        pan ? pan.toUpperCase() : null,
+        clean(billingAddress, 500),
+        modulesValue,
+      ]
     );
 
     res.json({
       success: true,
-      vendor: { id: result.insertId, fullName, email: cleanEmail, businessName: businessName || null },
+      vendor: {
+        id: result.insertId,
+        fullName,
+        email: cleanEmail,
+        businessName: clean(businessName, 200),
+        institutionType: type,
+        allowedModules: modulesValue,
+      },
     });
   } catch (err) {
     console.error("CREATE VENDOR ERROR:", err);
@@ -591,7 +813,9 @@ exports.getVendors = async (req, res) => {
   try {
     const [vendors] = await db.query(`
       SELECT
-        v.id, v.full_name, v.email, v.phone, v.business_name, v.gst_number, v.status, v.created_at,
+        v.id, v.full_name, v.contact_designation, v.email, v.phone, v.alt_phone,
+        v.business_name, v.institution_type, v.gst_number, v.pan_number, v.billing_address,
+        v.allowed_modules, v.status, v.created_at,
         COUNT(DISTINCT m.id) AS machine_count,
         COALESCE(SUM(CASE WHEN p.status='PRINTED' THEN p.amount ELSE 0 END), 0) AS total_revenue
       FROM vendors v
@@ -615,27 +839,36 @@ exports.getVendorDetail = async (req, res) => {
     const { vendorId } = req.params;
 
     const [[vendor]] = await db.query(
-      `SELECT id, full_name, email, phone, business_name, gst_number, status, created_at
+      `SELECT id, full_name, contact_designation, email, phone, alt_phone,
+              business_name, institution_type, gst_number, pan_number, billing_address,
+              allowed_modules, status, created_at
        FROM vendors WHERE id=?`,
       [vendorId]
     );
     if (!vendor) return res.status(404).json({ error: "Vendor not found" });
 
     const [machines] = await db.query(`
-      SELECT m.machine_id, m.name, m.status, m.last_seen_at,
-        COUNT(p.id) AS total_prints,
-        COALESCE(SUM(CASE WHEN p.status='PRINTED' THEN p.amount ELSE 0 END), 0) AS revenue
+      SELECT
+        ${MACHINE_LOCATION_COLUMNS},
+        COALESCE(ps.total_jobs, 0) AS total_prints,
+        COALESCE(ps.revenue, 0)    AS revenue
       FROM machines m
-      LEFT JOIN print_jobs p ON p.machine_id = m.machine_id AND p.status='PRINTED'
+      LEFT JOIN locations l ON l.id = m.location_id
+      LEFT JOIN vendors   v ON v.id = m.owner_vendor_id
+      ${PRINTED_STATS_JOIN}
       WHERE m.owner_vendor_id = ?
-      GROUP BY m.id
+      ORDER BY m.created_at DESC
     `, [vendorId]);
 
     const [[bank]] = await db.query(
       `SELECT * FROM bank_accounts WHERE vendor_id=? ORDER BY id DESC LIMIT 1`, [vendorId]
     );
 
-    res.json({ vendor, machines, bank: bank || null });
+    res.json({
+      vendor,
+      machines: machines.map((m) => ({ ...m, location_label: buildLocationLabel(m) })),
+      bank: bank || null,
+    });
   } catch (err) {
     console.error("GET VENDOR DETAIL ERROR:", err);
     res.status(500).json({ error: "Failed to fetch vendor detail" });
@@ -738,6 +971,7 @@ exports.getCustomerDetail = async (req, res) => {
 
 /* ===========================
    ASSIGN / UNASSIGN MACHINE
+   Assigning checks the vendor has bought the machine's module.
 =========================== */
 exports.assignMachineToVendor = async (req, res) => {
   try {
@@ -745,11 +979,19 @@ exports.assignMachineToVendor = async (req, res) => {
     const { vendorId } = req.body;
     if (!vendorId) return res.status(400).json({ error: "vendorId is required" });
 
-    const [[vendor]] = await db.query(`SELECT id FROM vendors WHERE id=?`, [vendorId]);
+    const [[vendor]] = await db.query(`SELECT id, allowed_modules FROM vendors WHERE id=?`, [vendorId]);
     if (!vendor) return res.status(404).json({ error: "Vendor not found" });
 
-    const [r] = await db.query(`UPDATE machines SET owner_vendor_id=? WHERE machine_id=?`, [vendorId, machineId]);
-    if (!r.affectedRows) return res.status(404).json({ error: "Machine not found" });
+    const [[machine]] = await db.query(`SELECT module FROM machines WHERE machine_id=?`, [machineId]);
+    if (!machine) return res.status(404).json({ error: "Machine not found" });
+
+    try {
+      assertVendorHasModule(vendor, machine.module || "KIOSK");
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+
+    await db.query(`UPDATE machines SET owner_vendor_id=? WHERE machine_id=?`, [vendorId, machineId]);
 
     res.json({ success: true });
   } catch (err) {
@@ -853,7 +1095,7 @@ exports.getRevenueOverview = async (req, res) => {
     `);
 
     const [perVendor] = await db.query(`
-      SELECT v.id AS vendor_id, v.full_name AS vendor_name,
+      SELECT v.id AS vendor_id, COALESCE(v.business_name, v.full_name) AS vendor_name,
         COALESCE(SUM(p.amount),0) AS revenue,
         COUNT(p.id) AS prints
       FROM vendors v
@@ -875,16 +1117,23 @@ exports.getRevenueOverview = async (req, res) => {
    have used THIS machine, with the same PAID_NOT_VERIFIED /
    STUCK_PRINTING / FAILED flags so problem jobs are visible either
    way you're looking at the data (by customer or by machine).
+   `machine` now also carries vendor, campus location, on-site contact
+   and timings for the detail page header.
 =========================== */
 exports.getMachineJobs = async (req, res) => {
   try {
     const { machineId } = req.params;
 
     const [[machine]] = await db.query(
-      `SELECT machine_id, name FROM machines WHERE machine_id=?`,
+      `SELECT ${MACHINE_LOCATION_COLUMNS}
+       FROM machines m
+       LEFT JOIN locations l ON l.id = m.location_id
+       LEFT JOIN vendors   v ON v.id = m.owner_vendor_id
+       WHERE m.machine_id=?`,
       [machineId]
     );
     if (!machine) return res.status(404).json({ error: "Machine not found" });
+    machine.location_label = buildLocationLabel(machine);
 
     const [jobs] = await db.query(`
       SELECT

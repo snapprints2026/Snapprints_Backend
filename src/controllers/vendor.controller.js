@@ -19,7 +19,9 @@ function periodCondition(range) {
 exports.getMe = async (req, res) => {
   try {
     const [[vendor]] = await db.query(
-      `SELECT id, full_name, email, phone, business_name, gst_number, status, created_at
+      `SELECT id, full_name, contact_designation, email, phone, alt_phone,
+              business_name, institution_type, gst_number, pan_number, billing_address,
+              allowed_modules, status, created_at
        FROM vendors WHERE id=?`,
       [req.staff.id]
     );
@@ -31,24 +33,44 @@ exports.getMe = async (req, res) => {
   }
 };
 
+/* "Main Campus · Block B, Ground floor · Library entrance" — where on the
+   campus a machine is. The vendor already knows which college it is. */
+function placeLabel(m) {
+  const where = [m.building, m.floor].filter(Boolean).join(", ");
+  const parts = [m.campus_name, where, m.spot].filter(Boolean);
+  return parts.length ? parts.join(" · ") : m.location_name || null;
+}
+
 /* ===========================
    GET /api/vendor/machines
-   List of owned machines with online status, print counts, revenue.
+   List of owned machines with online status, print counts, revenue,
+   and where each one is on campus (+ on-site contact and timings).
 =========================== */
 exports.getMyMachines = async (req, res) => {
   try {
     const [machines] = await db.query(`
       SELECT
-        m.machine_id, m.name, m.status, m.is_print_locked, m.last_seen_at,
-        l.name AS location_name, l.city, l.state,
-        COUNT(p.id) AS total_jobs,
-        SUM(CASE WHEN p.status='PRINTED' THEN 1 ELSE 0 END) AS total_prints,
-        COALESCE(SUM(CASE WHEN p.status='PRINTED' THEN p.amount ELSE 0 END), 0) AS total_revenue
+        m.machine_id, m.name, m.module, m.status, m.is_print_locked, m.last_seen_at,
+        l.name AS location_name, l.campus_name, l.building, l.floor, l.spot, l.landmark,
+        l.city, l.state, l.pincode,
+        l.contact_name, l.contact_phone,
+        TIME_FORMAT(l.open_time,  '%H:%i') AS open_time,
+        TIME_FORMAT(l.close_time, '%H:%i') AS close_time,
+        l.weekly_off,
+        COALESCE(ps.total_jobs, 0)    AS total_jobs,
+        COALESCE(ps.total_prints, 0)  AS total_prints,
+        COALESCE(ps.total_revenue, 0) AS total_revenue
       FROM machines m
       LEFT JOIN locations l ON l.id = m.location_id
-      LEFT JOIN print_jobs p ON p.machine_id = m.machine_id
+      LEFT JOIN (
+        SELECT machine_id,
+          COUNT(*) AS total_jobs,
+          SUM(CASE WHEN status='PRINTED' THEN 1 ELSE 0 END) AS total_prints,
+          SUM(CASE WHEN status='PRINTED' THEN amount ELSE 0 END) AS total_revenue
+        FROM print_jobs
+        GROUP BY machine_id
+      ) ps ON ps.machine_id = m.machine_id
       WHERE m.owner_vendor_id = ?
-      GROUP BY m.id
       ORDER BY m.created_at DESC
     `, [req.staff.id]);
 
@@ -56,7 +78,7 @@ exports.getMyMachines = async (req, res) => {
     const result = machines.map((m) => {
       let isOnline = false;
       if (m.last_seen_at) isOnline = (now - new Date(m.last_seen_at).getTime()) / 1000 < 120;
-      return { ...m, is_online: isOnline };
+      return { ...m, location_label: placeLabel(m), is_online: isOnline };
     });
 
     res.json(result);
