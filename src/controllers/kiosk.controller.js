@@ -288,23 +288,37 @@ exports.registerMachine = async (req, res) => {
       return res.json({ MACHINE_ID: existing.machine_id, API_KEY: apiKey, API_BASE: env.API_BASE_URL });
     }
 
-    const [[machine]] = await db.query(
-      `SELECT * FROM machines WHERE assigned=FALSE AND status='PENDING' LIMIT 1`
-    );
-    if (!machine) {
-      return res.status(400).json({ error: "No available machines. Create one from the admin panel first." });
+    // A Raspberry Pi may only take a KIOSK machine (SPK…), never a shop
+    // computer (SPS…). Oldest first, so SPK1001 is handed out before SPK1002.
+    // The UPDATE re-checks assigned=FALSE so two Pis booting at the same
+    // moment can't both claim the same machine.
+    const apiKey = crypto.randomBytes(32).toString("hex");
+    const keyHash = await bcrypt.hash(apiKey, 10);
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const [[machine]] = await db.query(
+        `SELECT machine_id FROM machines
+         WHERE assigned=FALSE AND status='PENDING' AND module='KIOSK'
+         ORDER BY id ASC
+         LIMIT 1`
+      );
+      if (!machine) {
+        return res.status(400).json({ error: "No available kiosk machines. Create one from the admin panel first." });
+      }
+
+      const [claim] = await db.query(
+        `UPDATE machines
+         SET assigned=TRUE, status='ACTIVE', device_serial=?, api_key_hash=?, api_key_plain=?, last_seen_at=NOW()
+         WHERE machine_id=? AND assigned=FALSE`,
+        [deviceSerial, keyHash, apiKey, machine.machine_id]
+      );
+      if (!claim.affectedRows) continue; // another Pi took it a moment ago — try the next one
+
+      console.log(`✅ New machine registered: ${machine.machine_id} (device ${deviceSerial})`);
+      return res.json({ MACHINE_ID: machine.machine_id, API_KEY: apiKey, API_BASE: env.API_BASE_URL });
     }
 
-    const apiKey = crypto.randomBytes(32).toString("hex");
-    await db.query(
-      `UPDATE machines
-       SET assigned=TRUE, status='ACTIVE', device_serial=?, api_key_hash=?, api_key_plain=?, last_seen_at=NOW()
-       WHERE machine_id=?`,
-      [deviceSerial, await bcrypt.hash(apiKey, 10), apiKey, machine.machine_id]
-    );
-
-    console.log(`✅ New machine registered: ${machine.machine_id}`);
-    res.json({ MACHINE_ID: machine.machine_id, API_KEY: apiKey, API_BASE: env.API_BASE_URL });
+    res.status(409).json({ error: "Could not claim a machine, please retry" });
   } catch (err) {
     console.error("REGISTER ERROR:", err);
     res.status(500).json({ error: "Registration failed" });
