@@ -9,6 +9,7 @@ const { getIO } = require("../socket/socket");
 const { calculatePrice } = require("../services/pricing.service");
 const { getPageCount } = require("../services/pdf.service");
 const storage = require("../services/storage.service");
+const convert = require("../services/convert.service");
 const { deleteJobFile } = require("../services/file.service");
 const { jobOwnerFilter } = require("../middleware/verifyCustomerToken");
 const { MAX_FILE_SIZE, EXT_TO_MIME, ALLOWED_LABEL } = require("../config/fileTypes");
@@ -52,7 +53,8 @@ exports.createUploadUrl = async (req, res) => {
     const ext = path.extname(fileName).toLowerCase();
     const contentType = EXT_TO_MIME[ext];
     if (!contentType) return res.status(400).json({ error: `Unsupported file type. Allowed: ${ALLOWED_LABEL}` });
-
+        if (!convert.canConvert(ext))
+      return res.status(400).json({ error: "Word and text files can't be printed right now. Please save the file as a PDF and upload again." });
     const [[machine]] = await db.query(
       `SELECT machine_id FROM machines WHERE machine_id=? AND status='ACTIVE'`, [machineId]
     );
@@ -78,7 +80,8 @@ exports.createUploadUrl = async (req, res) => {
   }
 };
 
-/* POST /api/jobs/:jobId/complete-upload   → { jobId, pages } */
+/* POST /api/jobs/:jobId/complete-upload   → { jobId, pages }
+   Every non-PDF upload is converted to PDF and replaces the original in R2. */
 exports.completeUpload = async (req, res) => {
   const { jobId } = req.params;
   try {
@@ -90,33 +93,58 @@ exports.completeUpload = async (req, res) => {
     );
     if (!job) return res.status(404).json({ error: "Job not found" });
     if (job.status !== "CREATED" || !job.file_path) return res.status(409).json({ error: "Invalid job state" });
-    // Already completed (e.g. the phone retried) → same answer again
     if (job.total_pages > 0) return res.json({ jobId, pages: job.total_pages });
 
-    const info = await storage.getInfo(job.file_path);
+    const originalKey = job.file_path;
+    const info = await storage.getInfo(originalKey);
     if (!info) return res.status(400).json({ error: "Upload did not finish. Please try again." });
     if (info.size > MAX_FILE_SIZE) {
-      await deleteJobFile(jobId, job.file_path);
-      await db.query(`DELETE FROM print_jobs WHERE job_id=? AND status='CREATED'`, [jobId]);
+      await discardJob(jobId, originalKey);
       return res.status(413).json({ error: "File is larger than 50 MB" });
     }
 
-    const ext = path.extname(job.file_path).toLowerCase();
+    const ext = path.extname(originalKey).toLowerCase();
+    let pdf;
     let totalPages;
     try {
-      const buffer = ext === ".pdf" ? await storage.getBuffer(job.file_path) : null;
-      totalPages = await getPageCount(buffer, ext);
+      const original = await storage.getBuffer(originalKey);
+      pdf = await convert.toPdf(original, ext);
+      totalPages = await getPageCount(pdf, ".pdf");
     } catch (e) {
-      await deleteJobFile(jobId, job.file_path);
-      await db.query(`DELETE FROM print_jobs WHERE job_id=? AND status='CREATED'`, [jobId]);
-      return res.status(400).json({ error: "Could not read this PDF. Is it damaged or password-protected?" });
+      console.error(`CONVERT ERROR (${ext}):`, jobId, e.message);
+      await discardJob(jobId, originalKey);
+      const msg = ext === ".pdf"
+        ? "Could not read this PDF. Is it damaged or password-protected?"
+        : "Could not prepare this file for printing. Please save it as a PDF and upload again.";
+      return res.status(400).json({ error: msg });
     }
     if (!totalPages || totalPages < 1) totalPages = 1;
 
-    await db.query(
-      `UPDATE print_jobs SET total_pages=?, updated_at=NOW() WHERE job_id=? AND status='CREATED'`,
-      [totalPages, jobId]
+    let finalKey = originalKey;
+    let finalName = job.file_name;
+    if (ext !== ".pdf") {
+      finalKey = originalKey.slice(0, -ext.length) + ".pdf";
+      finalName = convert.pdfNameFor(job.file_name);
+      await storage.put(finalKey, pdf, "application/pdf");
+    }
+
+    const [r] = await db.query(
+      `UPDATE print_jobs SET total_pages=?, file_path=?, file_name=?, updated_at=NOW()
+       WHERE job_id=? AND status='CREATED' AND file_path=? AND total_pages=0`,
+      [totalPages, finalKey, finalName, jobId, originalKey]
     );
+    if (finalKey !== originalKey && r.affectedRows) {
+      try {
+        await storage.remove(originalKey); // original photo/Word file no longer needed
+      } catch (e) {
+        console.error("ORIGINAL DELETE ERROR:", jobId, e.message);
+      }
+    }
+    if (!r.affectedRows) {
+      const [[now]] = await db.query(`SELECT total_pages FROM print_jobs WHERE job_id=?`, [jobId]);
+      if (now && now.total_pages > 0) return res.json({ jobId, pages: now.total_pages });
+      return res.status(409).json({ error: "Invalid job state" });
+    }
 
     getIO().emit("job_created", { jobId, machineId: job.machine_id, pages: totalPages });
     res.json({ jobId, pages: totalPages });
@@ -126,6 +154,13 @@ exports.completeUpload = async (req, res) => {
   }
 };
 
+/* Remove an unusable upload: file + unpaid job row. */
+async function discardJob(jobId, key) {
+  const [[row]] = await db.query(`SELECT file_path, total_pages FROM print_jobs WHERE job_id=?`, [jobId]);
+  if (!row || row.file_path !== key || row.total_pages > 0) return;
+  await deleteJobFile(jobId, key);
+  await db.query(`DELETE FROM print_jobs WHERE job_id=? AND status='CREATED' AND total_pages=0`, [jobId]);
+}
 /* GET /api/job-summary/:jobId */
 exports.getSummary = async (req, res) => {
   try {
