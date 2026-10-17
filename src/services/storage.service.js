@@ -94,11 +94,24 @@ async function getBuffer(key) {
   const bytes = await r.Body.transformToByteArray();
   return Buffer.from(bytes);
 }
-
+/* Upload bytes from the server (used to save the converted PDF). */
+async function put(key, body, contentType) {
+  requireClient();
+  await client.send(
+    new PutObjectCommand({
+      Bucket,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+      ContentLength: body.length,
+    })
+  );
+}
 /* Deleting is free on R2, and deleting a missing key is not an error. */
 async function remove(key) {
   requireClient();
   await client.send(new DeleteObjectCommand({ Bucket, Key: key }));
 }
 
-module.exports = { isEnabled, createUploadUrl, createDownloadUrl, getInfo, getBuffer, remove };
+
+module.exports = { isEnabled, createUploadUrl, createDownloadUrl, getInfo, getBuffer, put, remove };
