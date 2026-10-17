@@ -208,13 +208,21 @@ exports.updateJob = async (req, res) => {
 /* GET /api/job-status/:jobId */
 exports.getStatus = async (req, res) => {
   try {
-    const owner = jobOwnerFilter(req);
+        const owner = jobOwnerFilter(req);
     const [[job]] = await db.query(
-      `SELECT status FROM print_jobs WHERE job_id=? AND ${owner.sql}`,
+      `SELECT status, ref_code, refund_status, refund_amount,
+              (SELECT ji.status FROM job_issues ji WHERE ji.job_id = print_jobs.job_id) AS issue_status
+       FROM print_jobs WHERE job_id=? AND ${owner.sql}`,
       [req.params.jobId, ...owner.params]
     );
     if (!job) return res.status(404).json({ error: "Job not found" });
-    res.json({ status: job.status });
+    res.json({
+      status: job.status,
+      refCode: job.ref_code,
+      refundStatus: job.refund_status,   // null | PROCESSING | PENDING | PROCESSED | FAILED
+      refundAmount: job.refund_amount,
+      issueStatus: job.issue_status,     // null | OPEN | APPROVED | REJECTED | AUTO_APPROVED
+    });
   } catch (err) {
     console.error("JOB STATUS ERROR:", err);
     res.status(500).json({ error: "Internal server error" });

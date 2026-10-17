@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const admin = require("../controllers/admin.controller");
+const issue = require("../controllers/issue.controller");
 const { verifyAdminToken } = require("../middleware/verifyStaffToken");
 
 /* ── Existing routes (unchanged) ──
@@ -35,6 +36,11 @@ router.get("/machines/:machineId/jobs", verifyAdminToken, admin.getMachineJobs);
 
 /* ── Manual refunds (for stuck/expired jobs the auto-refund flow never caught) ── */
 router.post("/jobs/:jobId/refund", verifyAdminToken, admin.refundJob);
+/* ── Customer issues ("paid but no print") + support search ── */
+router.get("/issues", verifyAdminToken, issue.listIssues);
+router.patch("/issues/:issueId", verifyAdminToken, issue.resolveIssue);
+router.get("/jobs/search", verifyAdminToken, issue.searchJobs);
+router.post("/jobs/:jobId/issue", verifyAdminToken, issue.openIssueForJob);
 
 /* ── Withdrawals (approve / reject / mark paid) ── */
 router.get("/withdrawals", verifyAdminToken, admin.getWithdrawals);

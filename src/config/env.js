@@ -42,6 +42,16 @@ const env = {
   //   true  → LAUNCH:    customer must log in (OTP) before uploading
   // Default is true (secure). Set REQUIRE_CUSTOMER_LOGIN=false for the demo.
   REQUIRE_CUSTOMER_LOGIN: process.env.REQUIRE_CUSTOMER_LOGIN !== "false",
+    // How long the kiosk OTP works after payment. If it isn't used in time the
+  // job becomes EXPIRED and is refunded automatically.
+  OTP_TTL_MINUTES: parseInt(process.env.OTP_TTL_MINUTES || "30", 10),
+
+  // Refuse payment when the kiosk hasn't sent a heartbeat in the last 2 minutes.
+  // Set to "false" only for testing without a Raspberry Pi.
+  REQUIRE_MACHINE_ONLINE: process.env.REQUIRE_MACHINE_ONLINE !== "false",
+
+  // Customers can report a problem with a paid job for this long.
+  ISSUE_REPORT_WINDOW_HOURS: parseInt(process.env.ISSUE_REPORT_WINDOW_HOURS || "48", 10),
 };
 
 env.R2_ENABLED = !!(env.R2_ENDPOINT && env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY && env.R2_BUCKET);

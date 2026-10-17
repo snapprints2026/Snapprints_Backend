@@ -10,6 +10,7 @@ const { logAudit } = require("../services/audit.service");
 const { deleteJobFile, isStorageKey } = require("../services/file.service");
 const storage = require("../services/storage.service");
 const payment = require("../services/payment.service");
+const { refundJob } = require("../services/refund.service");
 
 const fileUrlFor = (jobId) => `/api/kiosk/jobs/${encodeURIComponent(jobId)}/file`;
 
@@ -227,13 +228,14 @@ exports.markFailed = async (req, res) => {
     );
     if (!r.affectedRows) return res.status(400).json({ error: "State transition failed" });
 
-    let refundId = null;
-    if (payment.isEnabled() && job.payment_id) {
+  
+        let refundId = null;
+    if (job.payment_id) {
       try {
-        const refund = await payment.refund(job.payment_id, job.amount);
-        refundId = refund.id;
+        const refund = await refundJob(jobId, { reason: `PRINTER_ERROR${req.body.error ? `: ${String(req.body.error).slice(0, 150)}` : ""}` });
+        refundId = refund.refundId || null;
       } catch (e) {
-        console.error("REFUND ERROR:", e.message);
+        console.error("REFUND ERROR:", e.message); // stays refund_status=FAILED → visible to admin
       }
     }
 

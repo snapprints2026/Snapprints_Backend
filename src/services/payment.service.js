@@ -24,9 +24,14 @@ function verifySignature(orderId, paymentId, signature) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-/* Payment method isn't in the checkout callback — fetch it. Non-fatal. */
+
+/* Payment method isn't in the checkout callback — fetch it. Non-fatal.
+   Also returns:
+     utr     — the reference number the customer sees in GPay / PhonePe / bank app
+     contact — the phone number typed on the Razorpay checkout
+   Both let support find a guest's payment later. */
 async function fetchPaymentMethod(paymentId) {
-  if (!razorpay) return { method: null, details: null };
+  if (!razorpay) return { method: null, details: null, utr: null, contact: null };
   try {
     const p = await razorpay.payments.fetch(paymentId);
     const method = p.method || null; // upi | card | netbanking | wallet | emi
@@ -36,17 +41,26 @@ async function fetchPaymentMethod(paymentId) {
       details = { network: p.card.network || null, last4: p.card.last4 || null, type: p.card.type || null };
     else if (method === "netbanking" && p.bank) details = { bank: p.bank };
     else if (method === "wallet" && p.wallet) details = { wallet: p.wallet };
-    return { method, details };
+
+    const a = p.acquirer_data || {};
+    const utr = a.rrn || a.upi_transaction_id || a.bank_transaction_id || null;
+    const contact = p.contact ? String(p.contact).replace(/[^\d]/g, "").slice(-10) : null;
+    return { method, details, utr: utr ? String(utr).slice(0, 40) : null, contact };
   } catch (err) {
     console.error("RAZORPAY PAYMENT FETCH ERROR:", err.message);
-    return { method: null, details: null };
+    return { method: null, details: null, utr: null, contact: null };
   }
 }
 
-/* amountRupees is what's stored in print_jobs.amount */
-async function refund(paymentId, amountRupees) {
+/* amountRupees is what's stored in print_jobs.amount.
+   notes show up in the Razorpay dashboard next to the refund. */
+async function refund(paymentId, amountRupees, notes = {}) {
   if (!razorpay) throw new Error("Payment service unavailable");
-  return razorpay.payments.refund(paymentId, { amount: Math.round(Number(amountRupees) * 100) });
+  return razorpay.payments.refund(paymentId, {
+    amount: Math.round(Number(amountRupees) * 100),
+    speed: "normal",
+    notes,
+  });
 }
 
 module.exports = { isEnabled, createOrder, verifySignature, fetchPaymentMethod, refund, keyId: env.RAZORPAY_KEY_ID };

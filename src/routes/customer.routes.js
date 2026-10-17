@@ -43,11 +43,14 @@ router.get("/history", verifyCustomerToken, async (req, res) => {
          pj.job_id, pj.file_name, pj.color, pj.copies, pj.paper_size, pj.print_side,
          pj.total_pages, pj.amount, pj.status, pj.payment_method,
          pj.created_at, pj.printed_at,
+         pj.ref_code, pj.payment_id IS NOT NULL AS is_paid,
+         pj.refund_status, pj.refund_amount, ji.status AS issue_status,
          pj.machine_id, m.name AS machine_name,
          l.name AS location_name, l.city
        FROM print_jobs pj
        LEFT JOIN machines m ON m.machine_id = pj.machine_id
        LEFT JOIN locations l ON l.id = m.location_id
+       LEFT JOIN job_issues ji ON ji.job_id = pj.job_id
        WHERE pj.customer_id=?
        ORDER BY pj.created_at DESC
        LIMIT 50`,

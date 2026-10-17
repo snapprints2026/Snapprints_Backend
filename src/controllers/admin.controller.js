@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const bcrypt  = require("bcrypt");
 const db      = require("../database/db");
+const { refundJob } = require("../services/refund.service");
 const razorpay = require("../config/razorpay"); // shared client (null if keys missing)
 const env     = require("../config/env");
 
@@ -1198,40 +1199,12 @@ exports.getMachineJobs = async (req, res) => {
 =========================== */
 exports.refundJob = async (req, res) => {
   try {
-    if (!razorpay) return res.status(503).json({ error: "Payment service unavailable" });
-
-    const { jobId } = req.params;
-
-    const [[job]] = await db.query(`SELECT * FROM print_jobs WHERE job_id=?`, [jobId]);
-    if (!job) return res.status(404).json({ error: "Job not found" });
-
-    if (!job.payment_id) {
-      return res.status(400).json({ error: "No payment was captured for this job — nothing to refund" });
-    }
-    if (!["PAID", "PRINTING", "EXPIRED", "FAILED"].includes(job.status)) {
-      return res.status(400).json({ error: `Refunding a job in status ${job.status} isn't supported` });
-    }
-
-    const refund = await razorpay.payments.refund(job.payment_id, {
-      amount: Math.round(Number(job.amount) * 100),
-    });
-
-    // Move it to FAILED so it drops out of the "needs attention" flags,
-    // and log the refund reference for reconciliation.
-    await db.query(
-      `UPDATE print_jobs SET status='FAILED', updated_at=NOW() WHERE id=?`,
-      [job.id]
-    );
-
-    await db.query(
-      `INSERT INTO audit_logs (machine_id, job_id, action_type, actor_admin_id, details)
-       VALUES (?, ?, 'JOB_FAILED', ?, ?)`,
-      [job.machine_id, job.job_id, req.staff.id, JSON.stringify({ manual_refund: true, refund_id: refund.id })]
-    );
-
-    res.json({ success: true, refundId: refund.id });
+    const result = await refundJob(req.params.jobId, { reason: "ADMIN_MANUAL", adminId: req.staff.id });
+    if (result.alreadyRefunded)
+      return res.status(409).json({ error: `Already refunded (${result.refundStatus})`, refundId: result.refundId });
+    res.json({ success: true, refundId: result.refundId, refundStatus: result.refundStatus });
   } catch (err) {
     console.error("REFUND JOB ERROR:", err);
-    res.status(500).json({ error: err.message || "Refund failed" });
+    res.status(err.status || 500).json({ error: err.message || "Refund failed" });
   }
 };

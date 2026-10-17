@@ -13,6 +13,7 @@ const cron = require("node-cron");
 const db = require("../database/db");
 const env = require("../config/env");
 const { deleteJobFile } = require("../services/file.service");
+const { refundJob } = require("../services/refund.service");
 
 const BATCH = 500;
 
@@ -30,13 +31,76 @@ async function removeAbandonedJobs() {
 }
 
 async function expireJobs() {
-  await db.query(
-    `UPDATE print_jobs pj
+  const [rows] = await db.query(
+    `SELECT pj.job_id
+     FROM print_jobs pj
      INNER JOIN print_job_tokens pjt ON pj.job_id = pjt.job_id
-     SET pj.status='EXPIRED', pj.updated_at=NOW()
-     WHERE pj.status='PAID' AND pjt.otp_expires_at < NOW()`
+     WHERE pj.status='PAID' AND pjt.otp_verified=0 AND pjt.otp_expires_at < NOW()
+     LIMIT ${BATCH}`
   );
+  for (const { job_id } of rows) {
+    const [r] = await db.query(
+      `UPDATE print_jobs SET status='EXPIRED', updated_at=NOW() WHERE job_id=? AND status='PAID'`,
+      [job_id]
+    );
+    if (r.affectedRows) await safeRefund(job_id, "OTP_EXPIRED");
+  }
   await db.query(`DELETE FROM print_job_tokens WHERE otp_expires_at < NOW() AND otp_verified=0`);
+
+  // Safety net: EXPIRED jobs from the last 7 days that never got a refund
+  // (e.g. Razorpay was down, or the server restarted mid-way).
+  const [missed] = await db.query(
+    `SELECT job_id FROM print_jobs
+     WHERE status='EXPIRED' AND payment_id IS NOT NULL AND refund_status IS NULL
+       AND updated_at > NOW() - INTERVAL 7 DAY
+     LIMIT 100`
+  );
+  for (const { job_id } of missed) await safeRefund(job_id, "OTP_EXPIRED");
+  return rows.length;
+}
+
+async function safeRefund(jobId, reason) {
+  try {
+    const r = await refundJob(jobId, { reason });
+    if (r.refunded) console.log(`💸 Auto refund ${jobId} (${reason}) → ${r.refundId}`);
+  } catch (e) {
+    console.error(`AUTO REFUND ERROR ${jobId}:`, e.message);
+  }
+}
+
+/* PRINTING for > 15 min with no printed/failed report → the kiosk probably
+   crashed. Don't refund blindly (it may have printed); open a case instead. */
+async function flagStuckJobs() {
+  const [r] = await db.query(
+    `INSERT IGNORE INTO job_issues (job_id, source, reason, details, status)
+     SELECT job_id, 'SYSTEM', 'STUCK', 'Kiosk did not confirm printed/failed within 15 minutes', 'OPEN'
+     FROM print_jobs
+     WHERE status='PRINTING' AND updated_at < NOW() - INTERVAL 15 MINUTE
+     LIMIT ${BATCH}`
+  );
+  return r.affectedRows;
+}
+
+async function safeRefund(jobId, reason) {
+  try {
+    const r = await refundJob(jobId, { reason });
+    if (r.refunded) console.log(`💸 Auto refund ${jobId} (${reason}) → ${r.refundId}`);
+  } catch (e) {
+    console.error(`AUTO REFUND ERROR ${jobId}:`, e.message);
+  }
+}
+
+/* PRINTING for > 15 min with no printed/failed report → the kiosk probably
+   crashed. Don't refund blindly (it may have printed); open a case instead. */
+async function flagStuckJobs() {
+  const [r] = await db.query(
+    `INSERT IGNORE INTO job_issues (job_id, source, reason, details, status)
+     SELECT job_id, 'SYSTEM', 'STUCK', 'Kiosk did not confirm printed/failed within 15 minutes', 'OPEN'
+     FROM print_jobs
+     WHERE status='PRINTING' AND updated_at < NOW() - INTERVAL 15 MINUTE
+     LIMIT ${BATCH}`
+  );
+  return r.affectedRows;
 }
 
 async function removeOldFiles() {
@@ -62,10 +126,17 @@ async function runCleanup() {
   } catch (err) {
     console.error("CLEANUP ABANDONED ERROR:", err);
   }
-  try {
-    await expireJobs();
+   try {
+    const n = await expireJobs();
+    if (n) console.log(`⌛ Expired ${n} unused OTP job(s)`);
   } catch (err) {
     console.error("CLEANUP JOBS ERROR:", err);
+  }
+  try {
+    const n = await flagStuckJobs();
+    if (n) console.log(`⚠️  Flagged ${n} stuck job(s) for review`);
+  } catch (err) {
+    console.error("STUCK JOBS ERROR:", err);
   }
   try {
     const n = await removeOldFiles();
